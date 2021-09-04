@@ -1,111 +1,18 @@
-import time
-import pymysql.cursors
-from pymysql.constants import CLIENT
-import psutil
 import subprocess
+import time
+
+import psutil
+from pymongo import MongoClient
 
 time_between = 5  # seconds
 megabyte = 1024 * 1024  # bytes
 
-# must be set up prior, tables will be created automatically
-db_credentials = {
-    "host": "localhost",
-    "username": "PCStats",
-    "password": "PCStatsP4ss",
-    "database": "PCStats",
-}
-connection = pymysql.connect(
-    host=db_credentials["host"],
-    user=db_credentials["username"],
-    password=db_credentials["password"],
-    database=db_credentials["database"],
-    cursorclass=pymysql.cursors.DictCursor,
-    client_flag=CLIENT.MULTI_STATEMENTS
-)
-
-# language=MySQL
-tables_def = """CREATE TABLE `data_store` (
-    `timestamp` BIGINT NOT NULL PRIMARY KEY UNIQUE,  # unix timestamp
-    `cpu_package_percent` TINYINT UNSIGNED, # percentage 0-100
-    `cpu_package_temperature` DECIMAL(4, 1),   # -999.9 - 999.9 °C
-    `ram_usage` INT UNSIGNED,   # mb
-    `ram_max` INT UNSIGNED,     # mb
-    `swap_usage` INT UNSIGNED,  # mb
-    `swap_max` INT UNSIGNED,    # mb
-    `load` DECIMAL(4, 2),  # 0 - 99.99
-    `network_up` INT UNSIGNED,  # bytes
-    `network_down` INT UNSIGNED # bytes
-);
-
-CREATE TABLE `cpu_cores` (
-    `timestamp` BIGINT NOT NULL, # unix timestamp
-    `index` TINYINT UNSIGNED NOT NULL,
-    `temperature` DECIMAL(4, 1),   # -999.9 - 999.9 °C
-    `usage_percent` TINYINT UNSIGNED,   # percentage 0-100
-    PRIMARY KEY (`timestamp`, `index`)
-);
-
-CREATE TABLE `gpu` (
-    `timestamp` BIGINT NOT NULL, # unix timestamp
-    `index` TINYINT UNSIGNED NOT NULL,
-    `temperature` DECIMAL(4, 1),   # -999.9 - 999.9 °C
-    `ram_usage` INT UNSIGNED,   # mb
-    `ram_max` INT UNSIGNED,     # mb
-    `utilization_percent` TINYINT UNSIGNED, # percentage 0-100
-    `fan_percent` TINYINT UNSIGNED, # percentage 0-100
-    PRIMARY KEY (`timestamp`, `index`)
-);
-
-CREATE TABLE `partitions` (
-    `timestamp` BIGINT NOT NULL, # unix timestamp
-    `path` VARCHAR(64) NOT NULL,
-    `size` INT UNSIGNED,    # mb
-    `used` INT UNSIGNED,    # mb 
-    PRIMARY KEY (`timestamp`, `path`)
-);"""
-table_insert_queries = {
-    'data_store':
-    # language=MySQL
-        """INSERT INTO data_store (`timestamp`, `cpu_package_percent`, `cpu_package_temperature`, `ram_usage`, 
-        `ram_max`, `swap_usage`, `swap_max`, `load`, `network_up`, `network_down`) VALUES (%s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s);""",
-    'cpu_cores':
-    # language=MySQL
-        """INSERT INTO cpu_cores (`timestamp`, `index`, `temperature`, `usage_percent`) VALUES (%s, %s, %s, %s);""",
-    'gpu':
-    # language=MySQL
-        """INSERT INTO gpu (`timestamp`, `index`, `temperature`, `ram_usage`, `ram_max`, `utilization_percent`, 
-        `fan_percent`) VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-    'partitions':
-    # language=MySQL
-        """INSERT INTO partitions (`timestamp`, `path`, `size`, `used`) VALUES (%s, %s, %s, %s)""",
-}
-tables_list = {'data_store', 'cpu_cores', 'gpu', 'partitions'}
+client = MongoClient("mongodb://root:root@localhost/", serverSelectionTimeoutMS=1000)
+db = client.PCStats
+db.main.create_index("timestamp", unique=True)
 
 nvidia_smi_query = "nvidia-smi --query-gpu=index,temperature.gpu,memory.used,memory.total,utilization.gpu,fan.speed " \
                    "--format=csv,noheader,nounits"
-
-
-def init_db():
-    print("Initializing database")
-    needs_creation = False
-    with connection:
-        with connection.cursor() as cursor:
-            # language=MySQL
-            cursor.execute("SHOW TABLES")
-            res = cursor.fetchall()
-            tables = {list(i.values())[0] for i in res}
-            if len(res) == 0 or not any(x in tables for x in tables_list):
-                needs_creation = True
-            elif not all(x in tables for x in tables_list):
-                print("partial table structure!")
-                exit(-1)
-
-        if needs_creation:
-            print("Creating tables")
-            with connection.cursor() as cursor:
-                cursor.execute(tables_def)
-            connection.commit()
 
 
 class GPU:
@@ -150,31 +57,39 @@ def store_readings():
     }
     last_network_stats = network
 
-    with connection:
-        with connection.cursor() as cursor:
-            cursor.execute(table_insert_queries['data_store'],
-                           (timestamp, cpu_package_percent, core_temps['Package id 0'], ram_data.used // megabyte,
-                            ram_data.total // megabyte, swap_data.used // megabyte, swap_data.total // megabyte, load,
-                            network_io['up'], network_io['down']))
-
-            for core_index in range(len(core_usage_percent)):
-                cursor.execute(table_insert_queries['cpu_cores'],
-                               (timestamp, core_index, core_temps[f'Core {core_index}'],
-                                core_usage_percent[core_index]))
-
-            for gpu in gpus:
-                cursor.execute(table_insert_queries['gpu'],
-                               (timestamp, gpu.index, gpu.temperature, gpu.ram_usage, gpu.ram_max, gpu.utilization,
-                                gpu.fan_percent))
-
-            for partition in partitions:
-                cursor.execute(table_insert_queries['partitions'],
-                               (timestamp, partition[0], partition[1].total // megabyte, partition[1].used // megabyte))
-        connection.commit()
+    db.main.insert_one({
+        "timestamp": timestamp,
+        "cpu_package_percent": cpu_package_percent,
+        "cpu_package_temperature": core_temps['Package id 0'],
+        "cpu_cores": [{
+            "index": core_index,
+            "temperature": core_temps[f'Core {core_index}'],
+            "usage_percent": core_usage_percent[core_index]
+        } for core_index in range(len(core_usage_percent))],
+        "ram_usage": ram_data.used // megabyte,
+        "ram_max": ram_data.total // megabyte,
+        "swap_usage": swap_data.used // megabyte,
+        "swap_max": swap_data.total // megabyte,
+        "load": load,
+        "network_up": network_io['up'],
+        "network_down": network_io['down'],
+        "gpus": [{
+            "index": gpu.index,
+            "temperature": gpu.temperature,
+            "ram_usage": gpu.ram_usage,
+            "ram_max": gpu.ram_max,
+            "utilization_percent": gpu.utilization,
+            "fan_percent": gpu.fan_percent,
+        } for gpu in gpus],
+        "partitions": [{
+            "path": partition[0],
+            "size": partition[1].total // megabyte,
+            "used": partition[1].used // megabyte,
+        } for partition in partitions],
+    })
 
 
 if __name__ == '__main__':
-    init_db()
     psutil.cpu_percent(interval=None)
     last_network_stats = psutil.net_io_counters()
     time.sleep(time_between)
