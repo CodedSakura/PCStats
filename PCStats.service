@@ -1,0 +1,12 @@
+[Unit]
+Description=Personal Computer Statistics, logged to ClickHouse
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+ExecStart=$DIR/PCStats/venv/bin/python "$DIR/PCStats/main.py"
+
+[Install]
+WantedBy=default.target
