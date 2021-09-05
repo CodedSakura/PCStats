@@ -1,8 +1,8 @@
 # PCStats
-PC Stat logging to MySQL database
+PC Stat logging to ClickHouse database
 
 ## Requirements
 - Python3
-- MySQL database
+- Docker & Docker compose
 - `nvidia-smi`
-- PIP packages `pymysql` and `psutil`
+- `liquidctl`
